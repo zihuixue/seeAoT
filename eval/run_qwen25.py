@@ -13,19 +13,36 @@ from transformers import Qwen2_5_VLForConditionalGeneration, AutoTokenizer, Auto
 from qwen_vl_utils import process_vision_info
 
 
-# Create an ArgumentParser object
-parser = argparse.ArgumentParser()
+def process_video_tensor_by_mode(video_list, mode):
+    if isinstance(video_list, list):
+        video = video_list[0]
+    else:
+        video = video_list
+    assert mode in [0, 1, 2, 3, 4]
+    if mode == 1:
+        video = video.flip(0)  # reverse along time axis
+    elif mode == 2:
+        video = torch.cat([video, torch.zeros_like(video[0])[None], torch.zeros_like(video[0])[None], video.flip(0)], dim=0) # forward video, black frames, reverse video
+    elif mode == 3:
+        video = torch.cat([video.flip(0), torch.zeros_like(video[0])[None], torch.zeros_like(video[0])[None], video], dim=0) # reverse video, black frames, forward video
+    elif mode == 4:  # shuffle
+        video = video[torch.randperm(len(video))]
+    if isinstance(video_list, list):
+        return [video]
+    return video
 
-# Add arguments
-parser.add_argument('--data_json', type=str, required=True, help='Path to the input JSON file containing video questions')
-parser.add_argument('--video_path', type=str, default='./data', help='Path to the video directory')
-parser.add_argument('--ckpt', type=str, default="Qwen/Qwen2.5-VL-7B-Instruct", help='Path to model checkpoints')
-parser.add_argument("--nframes", type=int, default=16, help="Number of frames to sample.")
-parser.add_argument("--sample_fps", type=float, default=0.0, help="Sample fps (0 means disable)")
-parser.add_argument("--save_name", type=str, default="", help="Save name")
 
-# Parse arguments
-args = parser.parse_args()
+def get_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--data_json', type=str, required=True, help='Path to the input JSON file containing video questions')
+    parser.add_argument('--video_path', type=str, default='./data', help='Path to the video directory')
+    parser.add_argument('--ckpt', type=str, default="Qwen/Qwen2.5-VL-7B-Instruct", help='Path to model checkpoints')
+    parser.add_argument("--nframes", type=int, default=16, help="Number of frames to sample.")
+    parser.add_argument("--sample_fps", type=float, default=0.0, help="Sample fps (0 means disable)")
+    parser.add_argument("--save_name", type=str, default="", help="Save name")
+    args = parser.parse_args()
+    return args
+    
 
 def set_seed(seed: int = 42):
     random.seed(seed)
@@ -44,9 +61,9 @@ def get_video_duration_opencv(video_path):
     cap.release()
     return duration
 
-def load_model():
+def load_model(ckpt):
     model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-        args.ckpt, 
+        ckpt, 
         torch_dtype=torch.bfloat16,   
         attn_implementation="flash_attention_2",
         device_map="auto" 
@@ -58,13 +75,13 @@ def load_model():
 
 ##################### Get response #####################
 @torch.no_grad()
-def get_response(model, tokenizer, processor, video_path, nframes, query):
+def get_response(model, tokenizer, processor, video_path, query, nframes, sample_fps=0, frame_process_mode=0, option_num=0, return_token_prob=False):
     assert os.path.exists(video_path), f"Video file {video_path} does not exist."
     video_duration = get_video_duration_opencv(video_path)
     if video_duration == 0:
         print(f'Video {video_path} has zero duration, skipping...')
         return 'Error'
-    fps = min(args.sample_fps, nframes / video_duration) if args.sample_fps > 0 else nframes / video_duration
+    fps = min(sample_fps, nframes / video_duration) if sample_fps > 0 else nframes / video_duration
     video_info = {"type": "video", "video": video_path, "fps": fps}
     messages = [
         {
@@ -79,7 +96,7 @@ def get_response(model, tokenizer, processor, video_path, nframes, query):
         messages, tokenize=False, add_generation_prompt=True
     )
     image_inputs, video_inputs, video_kwargs = process_vision_info(messages, return_video_kwargs=True)
-    
+    video_inputs = process_video_tensor_by_mode(video_inputs, frame_process_mode)
     inputs = processor(
         text=[text],
         images=image_inputs,
@@ -91,6 +108,12 @@ def get_response(model, tokenizer, processor, video_path, nframes, query):
     inputs = inputs.to("cuda")
     # type same as model
     inputs['pixel_values_videos'] = inputs['pixel_values_videos'].to(torch.bfloat16)
+    
+    if return_token_prob:
+        token_list = [chr(65 + i) for i in range(option_num)]
+        token_id_list = tokenizer.convert_tokens_to_ids(token_list)
+        token_probs = model.get_first_token_probs(**inputs, token_list=token_id_list)
+        return token_probs
     
     temperature = 0
     do_sample = False
@@ -108,7 +131,7 @@ def get_response(model, tokenizer, processor, video_path, nframes, query):
 
 def main(data_json):
     set_seed(42)
-    tokenizer, model, image_processor = load_model()
+    tokenizer, model, image_processor = load_model(args.ckpt)
     with open(data_json, 'r') as f:
         questions = json.load(f)
 
@@ -133,12 +156,12 @@ def main(data_json):
         if question["qa_idx"] in existing_responses:
             continue  
         video_path = os.path.join(args.video_path, question["video_name"])
-        response = get_response(model, tokenizer, image_processor, video_path, args.nframes, question["question"])
+        response = get_response(model, tokenizer, image_processor, video_path, question["question"], args.nframes, args.sample_fps)
         text_ans_file.write(json.dumps(dict(idx=question["qa_idx"], response=response)) + '\n')
         text_ans_file.flush()
     text_ans_file.close()
 
 
 if __name__ == "__main__":
-    args = parser.parse_args()
+    args = get_args()
     main(args.data_json)
